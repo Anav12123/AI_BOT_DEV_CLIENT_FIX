@@ -296,23 +296,29 @@ async function syncPending(){try{const d=await api('POST','/api/pending/sync');i
 
 async function loadStandups(){
 const dateInput=document.getElementById('standup-date');
-if(!dateInput.value){const today=new Date();dateInput.value=today.toISOString().split('T')[0]}
+if(!dateInput.value){const today=new Date();const y=today.getFullYear(),m=String(today.getMonth()+1).padStart(2,'0'),d=String(today.getDate()).padStart(2,'0');dateInput.value=`${y}-${m}-${d}`}
 const date=dateInput.value;
 const stats=document.getElementById('standup-stats');
 const list=document.getElementById('standup-list');
 list.innerHTML='<div class="su-empty">Loading...</div>';
 try{
-const d=await api('GET',`/api/standups?date=${date}`);
-if(!d){list.innerHTML='<div class="su-empty">Failed to load</div>';return}
-stats.innerHTML=`<div class="su-stat"><div class="sv">${d.total||0}</div><div class="sl">Total</div></div><div class="su-stat"><div class="sv">${d.completed||0}</div><div class="sl">Completed</div></div><div class="su-stat"><div class="sv" style="color:${d.blocker_count>0?'#f87171':'var(--green)'}">${d.blocker_count||0}</div><div class="sl">Blockers</div></div>`;
-if(!d.standups||!d.standups.length){list.innerHTML='<div class="su-empty">No standups for this date</div>';return}
-list.innerHTML=d.standups.map((s,i)=>renderStandup(s,i)).join('')
+const prev=new Date(date+'T12:00:00');prev.setDate(prev.getDate()-1);
+const prevStr=prev.getFullYear()+'-'+String(prev.getMonth()+1).padStart(2,'0')+'-'+String(prev.getDate()).padStart(2,'0');
+const [d1,d2]=await Promise.all([api('GET',`/api/standups?date=${date}`),api('GET',`/api/standups?date=${prevStr}`)]);
+const all=[...(d1?.standups||[]),...(d2?.standups||[])];
+const seen=new Set();
+const standups=all.filter(s=>{const k=s.developer;if(seen.has(k))return false;const ts=s.completed_at||s.started_at;if(ts){const ld=new Date(ts);const lds=ld.getFullYear()+'-'+String(ld.getMonth()+1).padStart(2,'0')+'-'+String(ld.getDate()).padStart(2,'0');if(lds!==date)return false}seen.add(k);return true});
+const blocker_count=standups.reduce((n,s)=>n+(s.blockers&&s.blockers!=='No blockers'?1:0),0);
+const completed=standups.filter(s=>s.completed).length;
+stats.innerHTML=`<div class="su-stat"><div class="sv">${standups.length}</div><div class="sl">Total</div></div><div class="su-stat"><div class="sv">${completed}</div><div class="sl">Completed</div></div><div class="su-stat"><div class="sv" style="color:${blocker_count>0?'#f87171':'var(--green)'}">${blocker_count}</div><div class="sl">Blockers</div></div>`;
+if(!standups.length){list.innerHTML='<div class="su-empty">No standups for this date</div>';return}
+list.innerHTML=standups.map((s,i)=>renderStandup(s,i)).join('')
 }catch(e){list.innerHTML='<div class="su-empty">Failed to load</div>'}}
 
 function renderStandup(s, idx){
 const dateStr = s.date || '';
-const timeStr = s.completed_at ? new Date(s.completed_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}) : '—';
-const dateDisplay = dateStr ? new Date(dateStr + 'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'}) : '';
+const timeStr = s.completed_at ? new Date(s.completed_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}) : (s.started_at ? new Date(s.started_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}) : '—');
+const dateDisplay = s.completed_at ? new Date(s.completed_at).toLocaleDateString('en-US',{month:'short',day:'numeric'}) : (s.started_at ? new Date(s.started_at).toLocaleDateString('en-US',{month:'short',day:'numeric'}) : '');
 const badge=s.completed?'<span class="su-badge done">✅ Done</span>':'<span class="su-badge partial">⏳ Partial</span>';
 const jiras=(s.jira_ids||[]).map(id=>`<a class="su-jira" href="${_jiraUrl}/browse/${id}" target="_blank">🎫 ${esc(id)}</a>`).join('');
 const blockerClass=s.blockers&&s.blockers!=='No blockers'?'su-blocker':'';
