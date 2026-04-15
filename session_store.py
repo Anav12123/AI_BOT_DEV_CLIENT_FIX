@@ -159,15 +159,17 @@ STANDUPS_FILE = os.environ.get("STANDUPS_FILE", "standups.json")
 
 
 def save_standup(standup_data: dict):
-    """Save a completed standup."""
+    """Save or update a standup (upsert by developer+date)."""
+    dev = standup_data.get("developer", "?")
+    date = standup_data.get("date", "?")
     with _lock:
         standups = _load_json(STANDUPS_FILE, [])
+        # Replace existing entry for same developer+date (enriched overwrites basic)
+        standups = [s for s in standups if not (s.get("developer") == dev and s.get("date") == date)]
         standups.insert(0, standup_data)
         if len(standups) > 500:
             standups = standups[:500]
         _save_json(STANDUPS_FILE, standups)
-    dev = standup_data.get("developer", "?")
-    date = standup_data.get("date", "?")
     print(f"[Standup] 💾 Saved standup for {dev} on {date}")
 
 
