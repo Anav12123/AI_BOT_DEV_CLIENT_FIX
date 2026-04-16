@@ -62,6 +62,9 @@ OUT_OF_CONTEXT = NOT a work answer. Includes:
   - Meta questions about the bot: "what can you do", "how do you work"
 REDO = explicit request to restart: "let me start over", "redo this standup"
 STOP = explicit cancel: "stop the standup", "cancel this", "I don't want to do standup"
+UNCLEAR = input does NOT clearly match any category above. Transcription may be garbled,
+          input may be partial/ambiguous, or intent is genuinely unclear. When in doubt,
+          use UNCLEAR — it's always safer to ask than to guess.
 
 Tone guidelines:
 - Be warm, encouraging, like a supportive teammate — not a robot
@@ -84,7 +87,8 @@ FILLER |
 EMPTY | Perfect, smooth sailing then.
 OUT_OF_CONTEXT |
 REDO |
-STOP |"""
+STOP |
+UNCLEAR |"""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PROMPT 2: SUMMARY + CONFIRM PHASE (replaces SUMMARY + CONFIRM prompts)
@@ -120,7 +124,7 @@ Developer said: "{response}"
 
 Output ONLY one keyword from below. No explanation. No preamble.
 
-CONFIRMED — agrees/done: "yes", "sounds good", "correct", "nothing", "no changes", "done", "bye", "ok", "that's it"
+CONFIRMED — agrees/done: "yes", "sounds good", "correct", "nothing", "no changes", "done", "bye", "ok", "that's it", "save it", "looks good"
 CORRECTION_YESTERDAY_REPLACE — new content for yesterday ("actually yesterday I did X")
 CORRECTION_YESTERDAY_ADD — adds to yesterday ("also worked on X")
 CORRECTION_TODAY_REPLACE — new content for today
@@ -132,9 +136,15 @@ COPIES_PREVIOUS_TODAY — same as last standup for today
 COPIES_PREVIOUS_BLOCKERS — same as last standup for blockers
 GUIDE_CHANGE — wants to change but gives NO content ("I need to change", "that's wrong")
 OUT_OF_CONTEXT — unrelated question ("what's my priority?", "check this ticket")
-REPEAT — repeat summary
+REPEAT — repeat summary ("say that again", "repeat", "can you say again")
 REDO — restart
+UNCLEAR — input does NOT clearly match ANY of the above. Includes:
+  - Garbled transcription: "Savior Sam", "Start Sam", random word jumbles
+  - Very short ambiguous utterances: "hmm", "uh", "yeah no"
+  - Mixed/contradictory signals: "yes no wait"
+  - Anything you're not confident about — prefer UNCLEAR over guessing
 
+IMPORTANT: When in doubt, output UNCLEAR. Never guess on destructive actions.
 CORRECTION needs ACTUAL work content. No content = GUIDE_CHANGE.
 "Today I'm working on X" with actual task = CORRECTION_TODAY_REPLACE, NOT COPIES_PREVIOUS."""
 
@@ -271,6 +281,11 @@ class StandupFlow:
         # Track when re-prompt is playing — allows fast interrupt (user finally speaking)
         self._playing_reprompt = False
 
+        # Unclear input counter — resets on state change or valid classification.
+        # After 2 UNCLEARs in the same state, fallback action kicks in (save what we have).
+        self._unclear_count = 0
+        self._unclear_state = None  # state where unclears accumulated (for reset detection)
+
     @property
     def is_done(self) -> bool:
         return self.state == StandupState.DONE
@@ -283,7 +298,31 @@ class StandupFlow:
     def _get_context(self) -> str:
         return "\n".join(self._history) if self._history else "(standup just started)"
 
+    # ── Unclear input tracking ────────────────────────────────────────────────
+
+    def _reset_unclear(self):
+        """Reset unclear counter — called on valid classification or state change."""
+        if self._unclear_count > 0:
+            print(f"[Standup] 🔄 Unclear counter reset (was {self._unclear_count})")
+        self._unclear_count = 0
+        self._unclear_state = None
+
+    def _track_unclear(self) -> int:
+        """Increment unclear counter, reset if state changed. Returns new count."""
+        if self._unclear_state != self.state:
+            self._unclear_count = 0
+            self._unclear_state = self.state
+        self._unclear_count += 1
+        return self._unclear_count
+
     # ── Groq (fast, user-facing) ──────────────────────────────────────────────
+    # Standup uses llama-3.3-70b-versatile (not the agent's default 8b) — the larger
+    # model is significantly more accurate at classification (CONFIRM intent, OUT_OF_CONTEXT
+    # detection, CORRECTION detection). Temperature 0 for deterministic classification.
+    # Latency is similar to 8b on Groq (500-1000ms) so no user-perceptible cost.
+
+    STANDUP_MODEL = "llama-3.3-70b-versatile"
+    STANDUP_TEMPERATURE = 0.0
 
     async def _groq(self, system: str, user_msg: str, max_tokens: int = 100) -> str:
         import time as _t
@@ -291,9 +330,9 @@ class StandupFlow:
         try:
             response = await asyncio.wait_for(
                 self.agent.client.chat.completions.create(
-                    model=self.agent.model,
+                    model=self.STANDUP_MODEL,
                     messages=[{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
-                    temperature=0.3, max_tokens=max_tokens,
+                    temperature=self.STANDUP_TEMPERATURE, max_tokens=max_tokens,
                 ),
                 timeout=5.0,
             )
@@ -527,6 +566,48 @@ class StandupFlow:
             self._start_silence_timer()
             return
 
+        if classification == "UNCLEAR":
+            attempt = self._track_unclear()
+            print(f"[Standup] ❓ UNCLEAR ({field}, attempt {attempt}/2)")
+
+            if attempt == 1:
+                # 1st clarification — gentle, warm
+                clarify = {
+                    "yesterday": "Sorry, I didn't quite catch that. Could you tell me what you worked on yesterday?",
+                    "today": "Sorry, could you say that again? What are you planning for today?",
+                    "blockers": "Sorry, didn't catch that. Any blockers, or are you all clear?",
+                }
+                r = clarify[field]
+                self._add_history("Sam", r)
+                await self.speak(r, f"standup-unclear-{field}-1", gen)
+                self._start_silence_timer()
+                return
+
+            elif attempt == 2:
+                # 2nd clarification — more explicit options
+                clarify = {
+                    "yesterday": "No worries — just briefly, what was yesterday's work? Even a short summary is fine.",
+                    "today": "No worries — what's on your plate today? Even a rough idea works.",
+                    "blockers": "No worries — just say 'yes, blockers' or 'no blockers'.",
+                }
+                r = clarify[field]
+                self._add_history("Sam", r)
+                await self.speak(r, f"standup-unclear-{field}-2", gen)
+                self._start_silence_timer()
+                return
+
+            else:
+                # 3rd UNCLEAR — fallback: save what we have and advance
+                print(f"[Standup] ⚠️  UNCLEAR max attempts reached — saving last input and advancing")
+                self.data[field]["raw"] = text if text.strip() else "(not provided)"
+                self._reset_unclear()
+                response = "I'll note that down and move on."
+                # Fall through to state advancement below
+
+        else:
+            # Any non-UNCLEAR classification resets the counter
+            self._reset_unclear()
+
         # Store raw answer
         if classification == "COPIES_PREVIOUS":
             copied = False
@@ -585,6 +666,9 @@ class StandupFlow:
         elif classification == "EMPTY" and field == "blockers":
             self.data["blockers"]["raw"] = "No blockers"
             response = "All clear, no blockers."
+        elif classification == "UNCLEAR":
+            # UNCLEAR fallback already set data and response above — don't overwrite
+            pass
         else:
             self.data[field]["raw"] = text
             response = ack if ack else "Got it."
@@ -661,6 +745,7 @@ class StandupFlow:
                 "CORRECTION_TODAY_ADD", "CORRECTION_TODAY_REPLACE",
                 "CORRECTION_BLOCKERS_ADD", "CORRECTION_BLOCKERS_REPLACE",
                 "GUIDE_CHANGE", "OUT_OF_CONTEXT", "CONFIRMED", "REDO", "REPEAT",
+                "UNCLEAR",
             ]
             matched = None
             for valid in _VALID_INTENTS:
@@ -677,11 +762,48 @@ class StandupFlow:
                     matched = "CORRECTION_BLOCKERS_ADD" if "ADD" in intent else "CORRECTION_BLOCKERS_REPLACE"
             if not matched and "COPIES_PREVIOUS" in intent:
                 matched = "COPIES_PREVIOUS_YESTERDAY"  # safe default
-            intent = matched or "CONFIRMED"  # Default CONFIRMED (safer than GUIDE_CHANGE)
+            # Default to UNCLEAR — safer than guessing CONFIRMED (which would silently save bad data)
+            intent = matched or "UNCLEAR"
             print(f"[Standup] 🔍 Confirm intent: {intent}")
         except Exception as e:
-            print(f"[Standup] ⚠️  Confirm LLM failed: {e} — defaulting CONFIRMED")
-            intent = "CONFIRMED"
+            print(f"[Standup] ⚠️  Confirm LLM failed: {e} — defaulting UNCLEAR")
+            intent = "UNCLEAR"
+
+        if intent == "UNCLEAR":
+            attempt = self._track_unclear()
+            print(f"[Standup] ❓ UNCLEAR (CONFIRM, attempt {attempt}/2)")
+
+            if attempt == 1:
+                # 1st clarification — natural, warm
+                r = "Sorry, I didn't quite catch that. Did you want to save the standup, change something, or hear it again?"
+                self._add_history("Sam", r)
+                await self.speak(r, "standup-confirm-unclear-1", gen)
+                self._start_silence_timer()
+                return
+
+            elif attempt == 2:
+                # 2nd clarification — explicit options (closed-set easier for STT)
+                r = "Let me give you clear options — please say 'save', 'change', or 'cancel'."
+                self._add_history("Sam", r)
+                await self.speak(r, "standup-confirm-unclear-2", gen)
+                self._start_silence_timer()
+                return
+
+            else:
+                # 3rd UNCLEAR — fallback: save what we have
+                print(f"[Standup] ⚠️  UNCLEAR max attempts reached — saving standup as-is")
+                self._reset_unclear()
+                r = "I'll save what we have. You can always update it in Jira. Have a good day!"
+                self._add_history("Sam", r)
+                await self.speak(r, "standup-unclear-fallback-save", gen)
+                self.data["completed"] = True
+                self.data["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                self.state = StandupState.DONE
+                print(f"[Standup] ✅ {self.developer}'s standup saved via UNCLEAR fallback")
+                return
+
+        # Any non-UNCLEAR intent — reset unclear counter
+        self._reset_unclear()
 
         if intent == "CONFIRMED":
             r = "Great, standup saved. Have a productive day!"
