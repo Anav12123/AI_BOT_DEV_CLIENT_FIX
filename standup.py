@@ -50,13 +50,18 @@ They said: "{text}"
 Respond in this format: KEYWORD | one sentence acknowledgment
 
 Keywords:
-ANSWER = work/task/ticket content (use this if unsure)
-FILLER = meaningless noise, gibberish
-COPIES_PREVIOUS = "same as yesterday", "nothing changed"
+ANSWER = real work/task/ticket content for the question asked
+FILLER = meaningless noise, gibberish, unintelligible
+COPIES_PREVIOUS = "same as yesterday", "nothing changed", "ditto"
 EMPTY = "no blockers", "none" (blockers question only)
-OUT_OF_CONTEXT = unrelated question like "what's my priority?" or "check this ticket"
-REDO = restart standup
-STOP = cancel standup
+OUT_OF_CONTEXT = NOT a work answer. Includes:
+  - Resistance/pushback: "why should I tell you", "that's none of your business", "I don't want to answer", "who are you to ask"
+  - Personal/chit-chat: "how are you Sam", "what's up", "are you a robot", "how's your day"
+  - Trivia/general knowledge: "what's the weather", "tell me a joke", "who is the president", "what's 2+2"
+  - Unrelated work questions: "what's my priority", "show me tickets", "what did John work on"
+  - Meta questions about the bot: "what can you do", "how do you work"
+REDO = explicit request to restart: "let me start over", "redo this standup"
+STOP = explicit cancel: "stop the standup", "cancel this", "I don't want to do standup"
 
 Tone guidelines:
 - Be warm, encouraging, like a supportive teammate — not a robot
@@ -77,7 +82,9 @@ ANSWER | Oof, sorry to hear about that blocker — hope it clears up.
 ANSWER | Thanks for flagging that, we'll keep an eye on it.
 FILLER |
 EMPTY | Perfect, smooth sailing then.
-OUT_OF_CONTEXT |"""
+OUT_OF_CONTEXT |
+REDO |
+STOP |"""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PROMPT 2: SUMMARY + CONFIRM PHASE (replaces SUMMARY + CONFIRM prompts)
@@ -466,6 +473,11 @@ class StandupFlow:
                         classification = "ANSWER"
                     else:
                         classification = llm_class
+                elif llm_class in ("OUT_OF_CONTEXT", "REDO", "STOP", "FILLER"):
+                    # Escape-hatch override: fast-path said ANSWER but LLM caught
+                    # resistance/trivia/refusal — trust the LLM's judgment
+                    print(f"[Standup] 📋 LLM override: fast-path ANSWER → {llm_class}")
+                    classification = llm_class
                 elif ack:
                     pass  # keep fast-path classification, use LLM ack
                 print(f"[Standup] 📋 Classify: {classification}" + (f" (LLM)" if llm_class else ""))
@@ -505,9 +517,9 @@ class StandupFlow:
 
         if classification == "OUT_OF_CONTEXT":
             redirect = {
-                "yesterday": "I can help with that after the standup. For now, what did you work on yesterday?",
-                "today": "I can help with that after the standup. What are you planning to work on today?",
-                "blockers": "I can help with that after the standup. Any blockers?",
+                "yesterday": "Let's stay focused on the standup for now — what did you work on yesterday?",
+                "today": "Let's stick with the standup for now — what are you planning for today?",
+                "blockers": "Let's wrap up the standup first — any blockers, or are you all clear?",
             }
             r = redirect[field]
             self._add_history("Sam", r)
