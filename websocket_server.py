@@ -929,6 +929,9 @@ class BotSession:
                 project_key = self.jira.project if self.jira and self.jira.enabled else "SCRUM"
                 clean_text = _convert_spoken_ticket_refs(text.strip(), project_key)
                 print(f"[{ts()}] {self.tag} 🎯 Flux FINAL: \"{clean_text[:60]}\"")
+                # Clear Nova-3's stale partial_text so silence-timer skip check is accurate
+                self.partial_text = ""
+                self.partial_speaker = ""
                 self._standup_buffer.append(clean_text)
                 # Process — if speculative Groq result is cached, handle() uses it
                 await self._process_standup_buffer(self._flux_developer)
