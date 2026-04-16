@@ -118,6 +118,7 @@ class CartesiaSpeaker:
 
         print(f"[Speaker] {len(self._cartesia_keys)} Cartesia key(s) loaded")
         self._key_index = 0
+        self._failed_keys = set()  # Keys that failed at runtime (blacklisted for session)
 
         self._cartesia_client = httpx.AsyncClient(timeout=30, limits=limits)
         self._recall_client   = httpx.AsyncClient(timeout=30, limits=limits)
@@ -161,9 +162,32 @@ class CartesiaSpeaker:
             print(f"[Speaker] ⚠️  No valid Cartesia keys!")
 
     def _next_key(self) -> str:
+        """Get next Cartesia key, skipping any that have failed at runtime.
+        Falls back to any key if all are blacklisted (maybe they've recovered)."""
+        attempts = 0
+        while attempts < len(self._cartesia_keys):
+            key = self._cartesia_keys[self._key_index % len(self._cartesia_keys)]
+            self._key_index += 1
+            attempts += 1
+            if key not in self._failed_keys:
+                self._current_key = key
+                return key
+        # All keys blacklisted — fall back to any (maybe quota reset, etc)
         key = self._cartesia_keys[self._key_index % len(self._cartesia_keys)]
         self._key_index += 1
+        self._current_key = key
+        print(f"[Speaker] ⚠️  All keys blacklisted — retrying anyway")
         return key
+
+    def _blacklist_current_key(self, reason: str = ""):
+        """Mark the currently-used key as failed for the rest of the session."""
+        key = getattr(self, '_current_key', None)
+        if key and key not in self._failed_keys:
+            self._failed_keys.add(key)
+            # Find which key number this was for logging
+            key_num = self._cartesia_keys.index(key) + 1 if key in self._cartesia_keys else "?"
+            active = len(self._cartesia_keys) - len(self._failed_keys)
+            print(f"[Speaker] 🚫 Blacklisted key #{key_num} ({reason}) — {active} key(s) remaining")
 
     def _next_cartesia_headers(self) -> dict:
         key = self._next_key()
@@ -210,73 +234,124 @@ class CartesiaSpeaker:
         self._cartesia_ws = await websockets.connect(url, ping_interval=20, ping_timeout=10)
         print("[Speaker] ✅ Cartesia WebSocket connected")
 
+    async def _close_ws(self):
+        """Close WebSocket so next call reconnects (with next key on retry)."""
+        if self._cartesia_ws:
+            try:
+                await self._cartesia_ws.close()
+            except Exception:
+                pass
+        self._cartesia_ws = None
+
     async def _stream_tts(self, text: str):
         """Stream TTS as PCM s16le chunks via Cartesia WebSocket.
 
-        Yields: bytes — raw PCM s16le chunks at 24kHz mono.
-        Each chunk is typically ~20ms of audio (960 bytes).
+        Rotates API keys on failure (WS disconnect, error message, 0-byte response).
+        Cannot retry mid-stream — once the first chunk is yielded, any subsequent
+        error is raised to the caller since audio has already been committed.
+
+        Yields: bytes — raw PCM s16le chunks at 48kHz mono.
         """
         text = _prep_for_tts(text)
         self._context_counter += 1
         context_id = f"ctx-{self._context_counter}"
 
-        async with self._ws_lock:
+        max_retries = max(1, len(self._cartesia_keys))
+        last_error = None
+        first_chunk_received = False
+
+        for attempt in range(max_retries):
+            # Connect (or reconnect with next key after prior failure)
             try:
-                await self._ensure_ws_connected()
+                async with self._ws_lock:
+                    await self._ensure_ws_connected()
             except Exception as e:
-                print(f"[Speaker] ⚠️  Cartesia WS connect failed: {e}")
-                raise
+                last_error = e
+                print(f"[Speaker] ⚠️  Cartesia WS connect failed (attempt {attempt+1}/{max_retries}): {e}")
+                continue
 
-        # Send TTS request
-        request = {
-            "model_id": CARTESIA_MODEL,
-            "transcript": text,
-            "voice": {"mode": "id", "id": CARTESIA_VOICE_ID},
-            "language": "en",
-            "context_id": context_id,
-            "output_format": {
-                "container": "raw",
-                "encoding": "pcm_s16le",
-                "sample_rate": 48000,
-            },
-            "continue": False,
-        }
+            # Send TTS request
+            request = {
+                "model_id": CARTESIA_MODEL,
+                "transcript": text,
+                "voice": {"mode": "id", "id": CARTESIA_VOICE_ID},
+                "language": "en",
+                "context_id": context_id,
+                "output_format": {
+                    "container": "raw",
+                    "encoding": "pcm_s16le",
+                    "sample_rate": 48000,
+                },
+                "continue": False,
+            }
 
-        try:
-            await self._cartesia_ws.send(json.dumps(request))
             total_bytes = 0
-            first_chunk = True
+            stream_error = None
 
-            while True:
-                raw = await asyncio.wait_for(self._cartesia_ws.recv(), timeout=10)
-                msg = json.loads(raw)
-
-                if msg.get("context_id") != context_id:
-                    continue
-
-                if msg.get("type") == "chunk" and msg.get("data"):
-                    pcm_bytes = base64.b64decode(msg["data"])
-                    total_bytes += len(pcm_bytes)
-                    if first_chunk:
-                        print(f"[Speaker] 🔊 First PCM chunk ({len(pcm_bytes)} bytes)")
-                        first_chunk = False
-                    yield pcm_bytes
-
-                if msg.get("done"):
-                    break
-
-            duration_ms = (total_bytes / 2 / 48000) * 1000
-            print(f"[Speaker] ✅ Streamed {total_bytes} bytes ({duration_ms:.0f}ms audio)")
-
-        except Exception as e:
-            print(f"[Speaker] ⚠️  Stream TTS error: {e}")
-            # Close broken connection so next call reconnects
             try:
-                await self._cartesia_ws.close()
-            except Exception:
-                pass
-            self._cartesia_ws = None
-            raise
+                await self._cartesia_ws.send(json.dumps(request))
+
+                while True:
+                    raw = await asyncio.wait_for(self._cartesia_ws.recv(), timeout=10)
+                    msg = json.loads(raw)
+
+                    if msg.get("context_id") != context_id:
+                        continue
+
+                    msg_type = msg.get("type", "")
+
+                    # Explicit error from Cartesia (bad key, quota exhausted, etc)
+                    if msg_type == "error":
+                        err_msg = msg.get("error") or msg.get("message") or str(msg)[:200]
+                        print(f"[Speaker] ❌ Cartesia error (attempt {attempt+1}/{max_retries}): {err_msg}")
+                        stream_error = Exception(f"Cartesia error: {err_msg}")
+                        break
+
+                    # Audio chunk — yield to caller
+                    if msg_type == "chunk" and msg.get("data"):
+                        pcm_bytes = base64.b64decode(msg["data"])
+                        total_bytes += len(pcm_bytes)
+                        if not first_chunk_received:
+                            print(f"[Speaker] 🔊 First PCM chunk ({len(pcm_bytes)} bytes)")
+                            first_chunk_received = True
+                        yield pcm_bytes
+                    # Unexpected message type — log for debugging
+                    elif msg_type and msg_type != "chunk" and not msg.get("done"):
+                        print(f"[Speaker] ℹ️  Cartesia msg type={msg_type}: {str(msg)[:200]}")
+
+                    # Stream finished
+                    if msg.get("done"):
+                        break
+
+            except Exception as e:
+                stream_error = e
+                print(f"[Speaker] ⚠️  Stream TTS error (attempt {attempt+1}/{max_retries}): {e}")
+
+            # Evaluate outcome
+            if total_bytes > 0 and stream_error is None:
+                # Success
+                duration_ms = (total_bytes / 2 / 48000) * 1000
+                print(f"[Speaker] ✅ Streamed {total_bytes} bytes ({duration_ms:.0f}ms audio)")
+                return
+
+            # Failure path — close WS so next attempt reconnects with new key
+            await self._close_ws()
+            last_error = stream_error or Exception("Cartesia returned 0 bytes")
+
+            if first_chunk_received:
+                # Already yielded audio — cannot retry cleanly
+                print(f"[Speaker] ⚠️  Mid-stream failure after {total_bytes} bytes — cannot retry")
+                raise last_error
+
+            # Pre-first-chunk failure — blacklist this key and rotate
+            reason = str(last_error)[:60] if last_error else "0 bytes"
+            self._blacklist_current_key(reason)
+
+            if attempt < max_retries - 1:
+                print(f"[Speaker] 🔁 Rotating to next Cartesia key...")
+
+        # All keys exhausted
+        raise Exception(f"All {max_retries} Cartesia TTS attempt(s) failed. Last error: {last_error}")
 
     # ══════════════════════════════════════════════════════════════════════════
     # Recall.ai audio injection (fallback mode)
