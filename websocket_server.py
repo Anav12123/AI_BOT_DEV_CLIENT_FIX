@@ -523,13 +523,18 @@ class BotSession:
                 # ── Fast interrupt: stop Sam's audio on first interim words ──
                 if self.speaking and self.audio_playing and not self.playing_ack and not self._partial_interrupted:
                     # In standup Q&A phase, don't interrupt — user speech gets buffered
+                    # EXCEPTION: if a re-prompt is playing, user is finally answering → interrupt!
                     if self.standup_flow and not self.standup_flow.is_done:
                         from standup import StandupState
-                        if self.standup_flow.state not in (StandupState.CONFIRM, StandupState.SUMMARY):
-                            return  # Q&A phase — buffer, don't interrupt
-                        # Only interrupt long audio (summary >5s), not short acks (<3s)
-                        if self._current_audio_duration < 5.0:
-                            return  # Short response — don't interrupt, buffer instead
+                        is_reprompt = getattr(self.standup_flow, '_playing_reprompt', False)
+                        if not is_reprompt:
+                            if self.standup_flow.state not in (StandupState.CONFIRM, StandupState.SUMMARY):
+                                return  # Q&A phase — buffer, don't interrupt
+                            # Only interrupt long audio (summary >5s), not short acks (<3s)
+                            if self._current_audio_duration < 5.0:
+                                return  # Short response — don't interrupt, buffer instead
+                        else:
+                            print(f"[{ts()}] {self.tag} ⚡ Re-prompt interrupted — user is answering")
 
                     # Don't interrupt for very short interims (single word could be noise)
                     word_count = len(text.split())
@@ -930,6 +935,27 @@ class BotSession:
             else:
                 # Interim update — user still speaking
                 print(f"[{ts()}] {self.tag} 🎯 Flux interim: \"{text.strip()[:60]}\"")
+
+                # Fast interrupt: if re-prompt is playing and user has spoken 2+ words,
+                # stop the re-prompt immediately (user is finally answering)
+                if (self.standup_flow
+                    and getattr(self.standup_flow, '_playing_reprompt', False)
+                    and self.speaking
+                    and self.audio_playing
+                    and not self._partial_interrupted
+                    and len(text.strip().split()) >= 2):
+                    self._partial_interrupted = True
+                    self._partial_interrupt_time = time.time()
+                    print(f"[{ts()}] {self.tag} ⚡ Re-prompt interrupted via Flux interim: \"{text.strip()[:40]}\" — stopping audio")
+                    try:
+                        await self._stop_all_audio()
+                    except Exception as e:
+                        print(f"[{ts()}] {self.tag} ⚠️  Stop audio failed (non-fatal): {e}")
+                    self.interrupt_event.set()
+                    if self.current_task and not self.current_task.done():
+                        self.current_task.cancel()
+                    self.speaking = False
+                    self.audio_playing = False
 
         async def _flux_eager_eot_callback(transcript, confidence):
             """EagerEndOfTurn — start speculative Groq classification.
