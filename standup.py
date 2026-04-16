@@ -58,11 +58,25 @@ OUT_OF_CONTEXT = unrelated question like "what's my priority?" or "check this ti
 REDO = restart standup
 STOP = cancel standup
 
-Examples:
-ANSWER | Nice, login page fix done.
-ANSWER | Got it, working on SCRUM-32.
+Tone guidelines:
+- Be warm, encouraging, like a supportive teammate — not a robot
+- VARY your phrasing — NEVER start every ack with "Got it"
+- For yesterday's work: celebrate or appreciate completed work
+- For today's plan: be supportive and encouraging about the plan
+- For blockers: be empathetic, acknowledge the difficulty
+- Keep acks SHORT — under 12 words, no questions (the next question is added automatically)
+
+Examples (notice the variety in starters and warmth):
+ANSWER | Nice work wrapping up the login fix yesterday.
+ANSWER | Awesome, great to hear the payment module is done.
+ANSWER | Solid progress on the video upload issue.
+ANSWER | Sounds like a focused day on SCRUM-32.
+ANSWER | Perfect, that's a good one to tackle today.
+ANSWER | Love that you're picking up the API work.
+ANSWER | Oof, sorry to hear about that blocker — hope it clears up.
+ANSWER | Thanks for flagging that, we'll keep an eye on it.
 FILLER |
-EMPTY |
+EMPTY | Perfect, smooth sailing then.
 OUT_OF_CONTEXT |"""
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -246,6 +260,9 @@ class StandupFlow:
         # Speculative EagerEndOfTurn cache — pre-computed Groq result
         self._cached_qa_result = None   # Raw Groq output string
         self._cached_qa_text = ""       # Transcript used for the cached result
+
+        # Track when re-prompt is playing — allows fast interrupt (user finally speaking)
+        self._playing_reprompt = False
 
     @property
     def is_done(self) -> bool:
@@ -1189,7 +1206,7 @@ class StandupFlow:
 
     async def _silence_reprompt(self):
         try:
-            await asyncio.sleep(15.0)
+            await asyncio.sleep(10.0)
             prompts = {
                 StandupState.ASK_YESTERDAY: "Still there? What did you work on yesterday?",
                 StandupState.ASK_TODAY: "What's your plan for today?",
@@ -1204,7 +1221,11 @@ class StandupFlow:
                     return
                 print(f"[Standup] ⏰ Re-prompting ({self.state.name})")
                 self._add_history("Sam", prompt)
-                await self.speak(prompt, "standup-reprompt", self._generation)
+                self._playing_reprompt = True
+                try:
+                    await self.speak(prompt, "standup-reprompt", self._generation)
+                finally:
+                    self._playing_reprompt = False
                 self._start_silence_timer()
         except asyncio.CancelledError:
             pass
