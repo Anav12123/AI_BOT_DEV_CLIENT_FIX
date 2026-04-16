@@ -1218,6 +1218,10 @@ class StandupFlow:
                 # Skip re-prompt if new text already arrived (user started speaking)
                 if hasattr(self, '_check_buffer_fn') and self._check_buffer_fn and self._check_buffer_fn():
                     print(f"[Standup] ⏰ Skipped re-prompt — user already speaking")
+                    # IMPORTANT: restart timer anyway, in case the detection was stale data.
+                    # If user really is speaking, their transcript will process and cancel this timer.
+                    # If detection was wrong (stale partial_text), we'll re-check in another 10s.
+                    self._start_silence_timer()
                     return
                 print(f"[Standup] ⏰ Re-prompting ({self.state.name})")
                 self._add_history("Sam", prompt)
