@@ -225,6 +225,70 @@ Return ONLY valid JSON (no explanation, no markdown):
 }}"""
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PM DASHBOARD ONE-LINER (fast scannable summary shown on collapsed card)
+# ══════════════════════════════════════════════════════════════════════════════
+
+PM_ONE_LINER_PROMPT = """You are a concise summary writer for a PM dashboard.
+
+Developer: {developer}
+Yesterday's work: {yesterday}
+Today's plan: {today}
+Blockers: {blockers}
+Tickets mentioned: {jira_ids}
+
+Write a ONE-LINE summary (under 18 words) that a PM can scan at a glance.
+
+Format rules:
+- Lead with yesterday's completion/work, then today's focus
+- If there's a real blocker, mention it at the end with clear signal ("blocked on X")
+- If no blockers, do NOT mention blockers at all
+- Use past tense for yesterday, present continuous for today
+- NO filler words: no "the developer", "they said", "yesterday the developer"
+- Use actual ticket IDs mentioned (e.g. "SCRUM-32"), never invent new ones
+- Keep neutral/professional tone — no "crushed it", "nailed it", etc.
+
+Examples of good one-liners:
+- "Finished SCRUM-20 login fix, starting SCRUM-32 payment flow today."
+- "Completed API refactor, writing documentation — blocked on manager approval."
+- "Continuing SCRUM-15 video upload bug investigation, no blockers."
+- "Tested lead flow yesterday, picking up SCRUM-32 today."
+- "On leave yesterday, resuming dashboard work today."
+
+Output ONLY the one-liner. No explanation, no preamble, no quotes."""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BLOCKER CLASSIFIER (LLM-based — replaces brittle keyword matching)
+# ══════════════════════════════════════════════════════════════════════════════
+
+BLOCKER_CLASSIFY_PROMPT = """Classify whether this standup answer describes a REAL work blocker.
+
+A REAL blocker is anything slowing or preventing work: waiting on someone, stuck on a problem, team member unavailable, external dependencies, technical issues, approval delays.
+
+NOT a real blocker: phrasings meaning "no blockers", "all clear", "nothing", "none", "everything fine", "smooth sailing".
+
+Examples of REAL blockers:
+- "Manager on leave today, delays expected"
+- "API keeps timing out"
+- "Waiting on design review"
+- "Feeling stuck on the auth flow"
+- "Dependency package not updated yet"
+
+Examples of NOT real blockers:
+- "No blockers"
+- "None"
+- "All clear"
+- "Nothing to report"
+- "Smooth sailing"
+- "Everything is fine"
+- "N/A"
+
+Blocker text: "{text}"
+
+Respond with ONLY one word: YES or NO"""
+
+
 class StandupFlow:
     """Production standup: Groq-speed conversation, Azure background extraction."""
 
@@ -250,6 +314,8 @@ class StandupFlow:
             "today":     {"summary": "", "tasks": [], "jira_ids": [], "raw": ""},
             "blockers":  {"summary": "", "items": [], "jira_ids": [], "raw": ""},
             "completed": False,
+            "one_line_summary": "",  # PM dashboard one-liner, generated in background_finalize
+            "has_real_blocker": False,  # LLM classification in background_finalize
         }
 
         self._silence_task = None
@@ -970,12 +1036,17 @@ class StandupFlow:
             import re as _re_local
             y_match = _re_local.search(r'[Yy]esterday:\s*(.+?)(?:\.\s*[Tt]oday:)', clean)
             t_match = _re_local.search(r'[Tt]oday:\s*(.+?)(?:\.\s*(?:No blocker|Blocker|Sound|Does))', clean)
+            # Blockers: capture after "Blockers:" up to "Sound right"/"Does" or end
+            b_match = _re_local.search(r'[Bb]lockers?:\s*(.+?)(?:\.\s*(?:Sound|Does)|$)', clean)
             if y_match:
                 yesterday_for_extraction = y_match.group(1).strip().rstrip(".")
                 print(f"[Standup] 📋 Clean yesterday: {yesterday_for_extraction}")
             if t_match:
                 today_for_extraction = t_match.group(1).strip().rstrip(".")
                 print(f"[Standup] 📋 Clean today: {today_for_extraction}")
+            if b_match:
+                blockers_for_extraction = b_match.group(1).strip().rstrip(".")
+                print(f"[Standup] 📋 Clean blockers: {blockers_for_extraction}")
         else:
             yesterday_for_extraction = self.data["yesterday"]["raw"]
             today_for_extraction = self.data["today"]["raw"]
@@ -1095,7 +1166,17 @@ class StandupFlow:
 
             for field in ("yesterday", "today", "blockers"):
                 section = extracted.get(field, {})
-                self.data[field]["summary"] = section.get("summary", self.data[field]["raw"])
+                # Prefer the Groq confirmation clean summary (produced right before CONFIRM)
+                # over Azure's extraction summary — Azure often returns near-raw text,
+                # while Groq's "Yesterday: X. Today: Y. Blockers: Z." parsing gives cleaner display text.
+                if field == "yesterday" and self._confirmed_summary and yesterday_for_extraction and yesterday_for_extraction != self.data["yesterday"]["raw"]:
+                    self.data[field]["summary"] = yesterday_for_extraction
+                elif field == "today" and self._confirmed_summary and today_for_extraction and today_for_extraction != self.data["today"]["raw"]:
+                    self.data[field]["summary"] = today_for_extraction
+                elif field == "blockers" and self._confirmed_summary and blockers_for_extraction and blockers_for_extraction != (self.data["blockers"]["raw"] or "No blockers"):
+                    self.data[field]["summary"] = blockers_for_extraction
+                else:
+                    self.data[field]["summary"] = section.get("summary", self.data[field]["raw"])
                 self.data[field]["tasks"] = section.get("tasks", [])
                 ids = self._filter_jira_ids(section.get("jira_ids", []))
                 self.data[field]["jira_ids"] = ids
@@ -1151,6 +1232,26 @@ class StandupFlow:
                 if not self.data[field]["summary"]:
                     self.data[field]["summary"] = self.data[field]["raw"]
 
+        # Generate PM dashboard one-liner (runs after extraction — uses clean summaries)
+        try:
+            one_liner = await self._generate_one_liner()
+            self.data["one_line_summary"] = one_liner
+            print(f"[Standup] 📋 PM one-liner: \"{one_liner}\"")
+        except Exception as e:
+            print(f"[Standup] ⚠️  One-liner generation failed: {e}")
+            # Fallback handled in _generate_one_liner itself
+
+        # Classify whether blocker is real (LLM — replaces brittle keyword matching)
+        try:
+            has_blocker = await self._classify_real_blocker()
+            self.data["has_real_blocker"] = has_blocker
+            print(f"[Standup] 📋 Real blocker classified: {'YES' if has_blocker else 'NO'}")
+        except Exception as e:
+            print(f"[Standup] ⚠️  Blocker classification failed: {e}")
+            # Conservative fallback: if text is non-trivially long, assume real blocker
+            blocker_text = (self.data["blockers"].get("summary") or self.data["blockers"].get("raw") or "").strip()
+            self.data["has_real_blocker"] = len(blocker_text.split()) >= 3
+
         # bg_jira already created above for smart fetch
         if bg_jira:
             await self._auto_create_subtasks(bg_jira)
@@ -1160,6 +1261,69 @@ class StandupFlow:
             await bg_jira.close()
 
         print(f"[Standup] ✅ Background processing complete ({(time.time()-t0)*1000:.0f}ms total)")
+
+    async def _generate_one_liner(self) -> str:
+        """Generate a PM-scannable one-line summary for the dashboard.
+
+        Runs AFTER Azure extraction so we use clean summaries (not raw STT).
+        Falls back to simple concatenation if Groq fails.
+        """
+        yesterday = self.data["yesterday"].get("summary") or self.data["yesterday"].get("raw") or "(no update)"
+        today = self.data["today"].get("summary") or self.data["today"].get("raw") or "(no update)"
+        blockers = self.data["blockers"].get("summary") or self.data["blockers"].get("raw") or "No blockers"
+        jira_ids = ", ".join(sorted(self._all_jira_ids)) if self._all_jira_ids else "none"
+
+        try:
+            prompt = PM_ONE_LINER_PROMPT.format(
+                developer=self.developer,
+                yesterday=yesterday,
+                today=today,
+                blockers=blockers,
+                jira_ids=jira_ids,
+            )
+            result = await self._groq(prompt, "Generate PM one-liner", max_tokens=60)
+            # Clean up: strip quotes, remove trailing periods that LLM sometimes adds
+            result = result.strip().strip('"').strip("'").strip()
+            # Sanity check: if LLM returned something too long or empty, use fallback
+            if not result or len(result.split()) > 30:
+                raise ValueError(f"Invalid one-liner length: {len(result.split())} words")
+            return result
+        except Exception as e:
+            print(f"[Standup] ⚠️  One-liner LLM failed, using fallback: {e}")
+            # Simple template fallback
+            y = yesterday[:50].rstrip(".") if yesterday != "(no update)" else ""
+            t = today[:50].rstrip(".") if today != "(no update)" else ""
+            parts = []
+            if y:
+                parts.append(f"Yesterday: {y}")
+            if t:
+                parts.append(f"today: {t}")
+            if blockers and blockers.lower().strip() not in ("no blockers", "none", ""):
+                parts.append(f"blocked: {blockers[:40]}")
+            return ". ".join(parts) + "." if parts else "Standup completed."
+
+    async def _classify_real_blocker(self) -> bool:
+        """Use LLM to decide if the blockers field describes a real work blocker.
+
+        Replaces brittle keyword matching that false-positives on substrings
+        (e.g. "manager" contains "na" which was treated as "no blocker" shortcut).
+
+        Returns True for real blockers, False for "no blockers"-style phrasings.
+        Runs during background_finalize, result stored in has_real_blocker field.
+        """
+        # Get the blocker text — prefer summary (cleaner), fall back to raw
+        text = (self.data["blockers"].get("summary") or self.data["blockers"].get("raw") or "").strip()
+
+        # Empty text = no blocker (efficiency shortcut, not classification logic)
+        if not text:
+            return False
+
+        # Ask LLM
+        prompt = BLOCKER_CLASSIFY_PROMPT.format(text=text)
+        result = await self._groq(prompt, "Classify real blocker", max_tokens=5)
+        # Parse: look for YES/NO in the response (robust to whitespace, periods, quotes)
+        normalized = result.strip().upper().strip('"').strip("'").strip(".").strip()
+        return normalized.startswith("YES")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1377,19 +1541,24 @@ class StandupFlow:
             "completed": self.data["completed"],
             "yesterday": {
                 "summary": self.data["yesterday"].get("summary") or self.data["yesterday"]["raw"],
+                "raw": self.data["yesterday"].get("raw", ""),
                 "tasks": self.data["yesterday"]["tasks"],
                 "jira_ids": self.data["yesterday"]["jira_ids"],
             },
             "today": {
                 "summary": self.data["today"].get("summary") or self.data["today"]["raw"],
+                "raw": self.data["today"].get("raw", ""),
                 "tasks": self.data["today"]["tasks"],
                 "jira_ids": self.data["today"]["jira_ids"],
             },
             "blockers": {
                 "summary": self.data["blockers"].get("summary") or self.data["blockers"]["raw"],
+                "raw": self.data["blockers"].get("raw", ""),
                 "items": self.data["blockers"]["items"],
                 "jira_ids": self.data["blockers"]["jira_ids"],
             },
             "all_jira_ids": list(self._all_jira_ids),
             "status_updates": self._all_status_updates,
+            "one_line_summary": self.data.get("one_line_summary", ""),
+            "has_real_blocker": self.data.get("has_real_blocker", False),
         }
