@@ -1,0 +1,50 @@
+{
+    "developer": "Vanshita Gupta",
+    "date": "2026-04-16",
+    "started_at": "2026-04-16T09:45:12Z",
+    "completed_at": "2026-04-16T09:46:38Z",
+    "completed": true,
+    "yesterday": {
+      "summary": "Worked on SCRUM-28 login page UI fixes",
+      "raw": "Yesterday I was working on SCRUM-28, the login page UI fixes, and got most of the styling issues resolved.",
+      "tasks": [
+        "Worked on SCRUM-28 login page UI fixes"
+      ],
+      "jira_ids": [
+        "SCRUM-28"
+      ]
+    },
+    "today": {
+      "summary": "Continuing SCRUM-28 and picking up SCRUM-34",
+      "raw": "Today I'm continuing with SCRUM-28 to wrap up the remaining items and then picking up SCRUM-34 for the dashboard component.",
+      "tasks": [
+        "Continuing SCRUM-28",
+        "Picking up SCRUM-34"
+      ],
+      "jira_ids": [
+        "SCRUM-28",
+        "SCRUM-34"
+      ]
+    },
+    "blockers": {
+      "summary": "No blockers",
+      "raw": "No blockers, everything is on track.",
+      "items": [],
+      "jira_ids": []
+    },
+    "all_jira_ids": [
+      "SCRUM-28",
+      "SCRUM-34"
+    ],
+    "status_updates": [
+      {
+        "ticket": "SCRUM-28",
+        "action": "in_progress"
+      }
+    ],
+    "one_line_summary": "Worked on SCRUM-28 login UI yesterday, continuing it plus SCRUM-34 dashboard today — no blockers.",
+    "has_real_blocker": false,
+    "session_id": "a3c9f1e8-4b72-4d9e-9c15-8f2a1b3c7d5e",
+    "user": "admin",
+    "mode": "standup"
+  }
