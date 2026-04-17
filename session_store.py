@@ -192,8 +192,13 @@ def get_team_standups(date: str = None, user: str = None) -> list[dict]:
             "yesterday": s.get("yesterday", {}).get("summary", ""),
             "today": s.get("today", {}).get("summary", ""),
             "blockers": s.get("blockers", {}).get("summary", "No blockers"),
+            "yesterday_raw": s.get("yesterday", {}).get("raw", ""),
+            "today_raw": s.get("today", {}).get("raw", ""),
+            "blockers_raw": s.get("blockers", {}).get("raw", ""),
             "blocker_count": len(s.get("blockers", {}).get("items", [])),
+            "has_real_blocker": s.get("has_real_blocker", None),  # None = not classified (old data)
             "jira_ids": s.get("all_jira_ids", []),
+            "one_line_summary": s.get("one_line_summary", ""),
         })
     return results
 
