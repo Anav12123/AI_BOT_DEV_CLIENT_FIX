@@ -206,6 +206,14 @@ class BotSession:
         _FLUX_CHUNK_SIZE = 2560      # 80ms at 16kHz S16LE (recommended by Deepgram)
         self._FLUX_CHUNK_SIZE = _FLUX_CHUNK_SIZE
 
+        # Flux speech_off debounce — Recall's participant_events.speech_off signals
+        # user stopped speaking. We convert the current Flux interim text to FINAL
+        # after a debounce window (allows mid-sentence pauses without premature finalize).
+        # If speech_on fires within the debounce window, timer is cancelled.
+        self._flux_last_interim_text = ""         # latest interim text from Flux (cleared on FINAL)
+        self._flux_speech_off_task = None         # debounce timer task
+        self._FLUX_SPEECH_OFF_DEBOUNCE_MS = 300   # delay before treating speech_off as turn-end
+
         # Speculative processing (EagerEndOfTurn → pre-compute Groq before EndOfTurn confirms)
         self._speculative_task = None   # Background Groq classify task
         self._speculative_text = ""     # Transcript used for speculation
@@ -559,9 +567,28 @@ class BotSession:
                         self.vad.end_turn()
 
         elif event == "participant_events.speech_off":
-            pass
+            # In standup mode with Flux: user stopped producing audio.
+            # Flux can't detect silence-based EOT when mic is muted (no audio packets).
+            # Start a debounce timer — if silence persists past threshold, treat Flux's
+            # current interim as FINAL. If speech_on fires within debounce, cancel the timer.
+            if (self.standup_flow
+                and not self.standup_flow.is_done
+                and self._flux_enabled
+                and self._flux_last_interim_text):
+                speaker_name = payload.get("data", {}).get("data", {}).get("participant", {}).get("name", "")
+                if speaker_name == self.standup_flow.developer:
+                    # Cancel any existing debounce (rare — back-to-back speech_off)
+                    if self._flux_speech_off_task and not self._flux_speech_off_task.done():
+                        self._flux_speech_off_task.cancel()
+                    self._flux_speech_off_task = asyncio.create_task(self._flux_debounce_finalize())
+
         elif event == "participant_events.speech_on":
             speaker = payload.get("data", {}).get("data", {}).get("participant", {}).get("name", "Unknown")
+            # Cancel pending speech_off debounce — user resumed speaking, Flux will get more audio
+            if self._flux_speech_off_task and not self._flux_speech_off_task.done():
+                print(f"[{ts()}] {self.tag} 🎤 speech_on — cancelling speech_off debounce")
+                self._flux_speech_off_task.cancel()
+                self._flux_speech_off_task = None
             # In standup mode, don't interrupt on speech_on — too aggressive (fires on mic noise)
             # Only partial_data (actual transcribed words) should interrupt during CONFIRM/SUMMARY
             if self.standup_flow and not self.standup_flow.is_done:
@@ -932,12 +959,19 @@ class BotSession:
                 # Clear Nova-3's stale partial_text so silence-timer skip check is accurate
                 self.partial_text = ""
                 self.partial_speaker = ""
+                # Clear Flux interim — turn processed, speech_off debounce won't re-finalize
+                self._flux_last_interim_text = ""
+                # Cancel any pending speech_off debounce — Flux already delivered the FINAL
+                if self._flux_speech_off_task and not self._flux_speech_off_task.done():
+                    self._flux_speech_off_task.cancel()
                 self._standup_buffer.append(clean_text)
                 # Process — if speculative Groq result is cached, handle() uses it
                 await self._process_standup_buffer(self._flux_developer)
             else:
                 # Interim update — user still speaking
                 print(f"[{ts()}] {self.tag} 🎯 Flux interim: \"{text.strip()[:60]}\"")
+                # Track latest interim so silence monitor can decide whether to Finalize
+                self._flux_last_interim_text = text.strip()
 
                 # Fast interrupt: if re-prompt is playing and user has spoken 2+ words,
                 # stop the re-prompt immediately (user is finally answering)
@@ -1059,10 +1093,54 @@ class BotSession:
                 await self._stt_task
             except (asyncio.CancelledError, Exception):
                 pass
+        # Cancel speech_off debounce timer if pending
+        if self._flux_speech_off_task and not self._flux_speech_off_task.done():
+            self._flux_speech_off_task.cancel()
+        self._flux_speech_off_task = None
         self._stt_task = None
         self._stt_queue = None
         self._flux_enabled = False
         self._flux_audio_buf = b""
+        self._flux_last_interim_text = ""
+
+    async def _flux_debounce_finalize(self):
+        """Wait for debounce window, then convert Flux's pending interim text to FINAL.
+
+        Called when Recall fires speech_off for the standup participant. If user resumes
+        speaking within debounce window, speech_on cancels this task.
+
+        This handles the case where Flux's native silence-based EOT won't fire because
+        the user muted their mic (no audio = no silence detection). speech_off tells us
+        the user stopped producing audio regardless of mute state.
+        """
+        try:
+            debounce_s = self._FLUX_SPEECH_OFF_DEBOUNCE_MS / 1000.0
+            await asyncio.sleep(debounce_s)
+
+            # Debounce window passed — user genuinely stopped. Promote interim to FINAL.
+            if not self._flux_enabled or not self.standup_flow or self.standup_flow.is_done:
+                return
+            interim = self._flux_last_interim_text
+            if not interim:
+                return  # no pending interim — nothing to finalize
+
+            project_key = self.jira.project if self.jira and self.jira.enabled else "SCRUM"
+            clean_text = _convert_spoken_ticket_refs(interim, project_key)
+            print(f"[{ts()}] {self.tag} 🔇 speech_off debounce ({self._FLUX_SPEECH_OFF_DEBOUNCE_MS}ms) — promoting interim to FINAL: \"{clean_text[:60]}\"")
+
+            # Clear interim and any speculative state — same as Flux FINAL handler
+            self._flux_last_interim_text = ""
+            self.partial_text = ""
+            self.partial_speaker = ""
+
+            # Feed into the same processing path as Flux's own FINAL
+            self._standup_buffer.append(clean_text)
+            await self._process_standup_buffer(self.standup_flow.developer)
+        except asyncio.CancelledError:
+            # speech_on fired within debounce — user resumed, no action needed
+            pass
+        except Exception as e:
+            print(f"[{ts()}] {self.tag} ⚠️  speech_off debounce error: {e}")
 
     async def _process_standup_buffer(self, speaker: str):
         """Process standup buffer immediately (called by Flux EndOfTurn or timer fallback)."""
