@@ -139,11 +139,17 @@ select.fi{cursor:pointer;appearance:auto}
 .su-stat .sv{font-size:24px;font-weight:700;color:var(--accent)}
 .su-stat .sl{font-size:11px;color:var(--text2);text-transform:uppercase;margin-top:2px}
 .su-card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);margin-bottom:12px;overflow:hidden}
-.su-head{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;cursor:pointer}
+.su-card.has-blocker{border-left:3px solid #f87171}
+.su-head{display:flex;align-items:flex-start;justify-content:space-between;padding:16px 20px;cursor:pointer;gap:12px}
 .su-head:hover{background:var(--card2)}
+.su-head-main{flex:1;min-width:0}
 .su-name{font-weight:700;font-size:15px}
 .su-time{font-size:12px;color:var(--text2)}
-.su-badge{font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px}
+.su-preview{font-size:13px;color:var(--text2);margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.4}
+.su-preview .sep{color:var(--border);margin:0 6px}
+.su-preview .blocker-chip{color:#f87171;font-weight:600}
+.su-card.expanded .su-preview{display:none}
+.su-badge{font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px;flex-shrink:0}
 .su-badge.done{background:var(--gglow);color:var(--green)}
 .su-badge.partial{background:var(--yglow);color:var(--yellow)}
 .su-body{padding:0 20px 16px;display:none}
@@ -154,6 +160,13 @@ select.fi{cursor:pointer;appearance:auto}
 .su-blocker{color:#f87171;font-weight:600}
 .su-jira{display:inline-flex;align-items:center;gap:4px;background:var(--card2);padding:3px 10px;border-radius:var(--rs);font-size:12px;font-weight:600;color:var(--accent);text-decoration:none;margin:2px 4px 2px 0}
 .su-jira:hover{background:var(--accent);color:#fff}
+.su-section.expandable{cursor:pointer;border-radius:6px;padding:8px;margin:-8px -8px 4px -8px;transition:background 0.1s}
+.su-section.expandable:hover{background:var(--card2)}
+.su-section.expandable .expand-arrow{display:inline-block;transition:transform 0.15s;color:var(--text2);margin-right:4px}
+.su-section.expandable.expanded .expand-arrow{transform:rotate(90deg)}
+.su-raw{display:none;margin-top:8px;padding:10px 12px;background:var(--card2);border-left:3px solid var(--accent);border-radius:4px;font-size:13px;font-style:italic;color:var(--text2);line-height:1.5}
+.su-section.expandable.expanded .su-raw{display:block}
+.su-raw .raw-label{font-size:10px;font-weight:700;text-transform:uppercase;font-style:normal;color:var(--text2);display:block;margin-bottom:4px;letter-spacing:0.5px}
 .su-empty{text-align:center;padding:40px;color:var(--text2)}
 
 @media(max-width:600px){.topbar{padding:12px 16px}.tab-bar{padding:0 16px}.tab-c{padding:20px 16px}.inp-g{flex-direction:column}.det{grid-template-columns:1fr}.mode-grid{grid-template-columns:1fr}.su-stats{flex-direction:column}}
@@ -308,12 +321,56 @@ const [d1,d2]=await Promise.all([api('GET',`/api/standups?date=${date}`),api('GE
 const all=[...(d1?.standups||[]),...(d2?.standups||[])];
 const seen=new Set();
 const standups=all.filter(s=>{const k=s.developer;if(seen.has(k))return false;const ts=s.completed_at||s.started_at;if(ts){const ld=new Date(ts);const lds=ld.getFullYear()+'-'+String(ld.getMonth()+1).padStart(2,'0')+'-'+String(ld.getDate()).padStart(2,'0');if(lds!==date)return false}seen.add(k);return true});
-const blocker_count=standups.reduce((n,s)=>n+(s.blockers&&s.blockers!=='No blockers'?1:0),0);
+// Sort: real blockers first (PM attention), then incomplete, then by completion time (newest first)
+standups.sort((a,b)=>{
+  const ab=_isRealBlocker(a)?1:0;
+  const bb=_isRealBlocker(b)?1:0;
+  if(ab!==bb)return bb-ab; // blockers first
+  const ac=a.completed?1:0;
+  const bc=b.completed?1:0;
+  if(ac!==bc)return ac-bc; // incomplete before complete
+  const at=new Date(a.completed_at||a.started_at||0).getTime();
+  const bt=new Date(b.completed_at||b.started_at||0).getTime();
+  return bt-at; // newest first
+});
+const blocker_count=standups.reduce((n,s)=>n+(_isRealBlocker(s)?1:0),0);
 const completed=standups.filter(s=>s.completed).length;
 stats.innerHTML=`<div class="su-stat"><div class="sv">${standups.length}</div><div class="sl">Total</div></div><div class="su-stat"><div class="sv">${completed}</div><div class="sl">Completed</div></div><div class="su-stat"><div class="sv" style="color:${blocker_count>0?'#f87171':'var(--green)'}">${blocker_count}</div><div class="sl">Blockers</div></div>`;
 if(!standups.length){list.innerHTML='<div class="su-empty">No standups for this date</div>';return}
-list.innerHTML=standups.map((s,i)=>renderStandup(s,i)).join('')
+list.innerHTML=standups.map((s,i)=>renderStandup(s,i)).join('');
+// Wire up expandable section click handlers (delegation avoids inline onclick quoting issues)
+list.querySelectorAll('[data-expandable="1"]').forEach(el=>{
+  el.addEventListener('click', function(ev){
+    ev.stopPropagation();
+    this.classList.toggle('expanded');
+  });
+});
 }catch(e){list.innerHTML='<div class="su-empty">Failed to load</div>'}}
+
+// Real-blocker check — prefers the LLM-classified flag from the API.
+// For old standups without the flag (saved before classifier was added), falls
+// back to a lightweight word-boundary heuristic as a best-effort legacy path.
+function _isRealBlocker(standupOrText){
+  // New path: API provides has_real_blocker boolean (LLM-classified)
+  if(typeof standupOrText === 'object' && standupOrText !== null && 'has_real_blocker' in standupOrText && standupOrText.has_real_blocker !== null){
+    return standupOrText.has_real_blocker === true;
+  }
+  // Legacy fallback: accept a text string for old standups missing the flag
+  const text = typeof standupOrText === 'string'
+    ? standupOrText
+    : (standupOrText && standupOrText.blockers) || '';
+  if(!text) return false;
+  const t = String(text).toLowerCase().trim();
+  if(!t || t === '—') return false;
+  // Word-boundary patterns (avoid "na" matching "manager" substring bug)
+  const noBlockerPatterns = [
+    /\bno blockers?\b/, /\bnone\b/, /\ball clear\b/, /\ball good\b/,
+    /\bnothing\b/, /\bno issues?\b/, /\bno problems?\b/,
+    /\bsmooth sailing\b/, /\bn\/a\b/, /\bnope\b/
+  ];
+  for(const re of noBlockerPatterns){ if(re.test(t)) return false; }
+  return true;
+}
 
 function renderStandup(s, idx){
 const dateStr = s.date || '';
@@ -321,18 +378,76 @@ const timeStr = s.completed_at ? new Date(s.completed_at).toLocaleTimeString([],
 const dateDisplay = s.completed_at ? new Date(s.completed_at).toLocaleDateString('en-US',{month:'short',day:'numeric'}) : (s.started_at ? new Date(s.started_at).toLocaleDateString('en-US',{month:'short',day:'numeric'}) : '');
 const badge=s.completed?'<span class="su-badge done">✅ Done</span>':'<span class="su-badge partial">⏳ Partial</span>';
 const jiras=(s.jira_ids||[]).map(id=>`<a class="su-jira" href="${_jiraUrl}/browse/${id}" target="_blank">🎫 ${esc(id)}</a>`).join('');
-const blockerClass=s.blockers&&s.blockers!=='No blockers'?'su-blocker':'';
+const hasBlocker=_isRealBlocker(s);
+const blockerClass=hasBlocker?'su-blocker':'';
+const cardClass=hasBlocker?'su-card has-blocker':'su-card';
+
+// Build one-line preview for collapsed view — prefer LLM-generated summary
+let previewHtml = '';
+if(s.one_line_summary && s.one_line_summary.trim()){
+  // LLM summary (clean prose, generated by background_finalize)
+  const summary = s.one_line_summary.trim();
+  if(hasBlocker){
+    previewHtml = `<div class="su-preview"><span>${esc(summary)}</span></div>`;
+  } else {
+    previewHtml = `<div class="su-preview">${esc(summary)}</div>`;
+  }
+} else {
+  // Fallback: mechanical concatenation (old standups, LLM failure)
+  const previewParts=[];
+  if(s.yesterday)previewParts.push(`<span>${esc(_truncate(s.yesterday,40))}</span>`);
+  if(s.today)previewParts.push(`<span>→ ${esc(_truncate(s.today,40))}</span>`);
+  if(hasBlocker)previewParts.push(`<span class="blocker-chip">⚠️ ${esc(_truncate(s.blockers,30))}</span>`);
+  if(previewParts.length)previewHtml=`<div class="su-preview">${previewParts.join('<span class="sep">•</span>')}</div>`;
+}
+const preview = previewHtml;
+
 const uid=`su-${esc(s.developer)}-${idx||0}`;
-return`<div class="su-card" id="${uid}">
+// Render a field — if raw differs from summary, make the whole section clickable
+// to toggle showing the raw text inline below.
+// [v2 — expandable sections with clickable fields]
+function _renderField(label, summary, raw, extraClass, sectionId){
+  const cls = extraClass || '';
+  const showRaw = _showRawToggle(summary, raw);
+  if(!showRaw){
+    // No raw to show — plain section
+    return `<div class="su-section"><div class="su-label">${label}</div><div class="su-text ${cls}">${esc(summary||'—')}</div></div>`;
+  }
+  // Clickable section — uses class + ID, click handler wired up after render
+  return `<div class="su-section expandable" data-expandable="1" id="${sectionId}">
+    <div class="su-label"><span class="expand-arrow">▸</span> ${label}</div>
+    <div class="su-text ${cls}">${esc(summary||'—')}</div>
+    <div class="su-raw"><span class="raw-label">What ${esc(s.developer)} said</span>${esc(raw)}</div>
+  </div>`;
+}
+return`<div class="${cardClass}" id="${uid}">
 <div class="su-head" onclick="document.getElementById('${uid}').classList.toggle('expanded')">
-<div><div class="su-name">${esc(s.developer)}</div><div class="su-time">${dateDisplay} ${timeStr}</div></div>
+<div class="su-head-main"><div class="su-name">${esc(s.developer)}</div><div class="su-time">${dateDisplay} ${timeStr}</div>${preview}</div>
 <div>${badge}</div></div>
 <div class="su-body">
-<div class="su-section"><div class="su-label">Yesterday</div><div class="su-text">${esc(s.yesterday||'—')}</div></div>
-<div class="su-section"><div class="su-label">Today</div><div class="su-text">${esc(s.today||'—')}</div></div>
-<div class="su-section"><div class="su-label">Blockers</div><div class="su-text ${blockerClass}">${esc(s.blockers||'No blockers')}</div></div>
+${_renderField('Yesterday', s.yesterday, s.yesterday_raw, '', `${uid}-y`)}
+${_renderField('Today', s.today, s.today_raw, '', `${uid}-t`)}
+${_renderField('Blockers', s.blockers||'No blockers', s.blockers_raw, blockerClass, `${uid}-b`)}
 ${jiras?`<div class="su-section"><div class="su-label">Jira Tickets</div><div>${jiras}</div></div>`:''}
 </div></div>`}
+
+// Decide whether to show the "What user said" toggle.
+// Hide if raw is empty, identical to summary, or >=90% word overlap (near-duplicate).
+function _showRawToggle(summary, raw){
+  if(!raw || !summary) return false;
+  const s = String(summary).trim().toLowerCase();
+  const r = String(raw).trim().toLowerCase();
+  if(!r || r === s) return false;
+  // Word-overlap similarity check
+  const sWords = new Set(s.split(/\s+/).filter(Boolean));
+  const rWords = r.split(/\s+/).filter(Boolean);
+  if(!rWords.length) return false;
+  const overlap = rWords.filter(w => sWords.has(w)).length;
+  return (overlap / rWords.length) < 0.9;
+}
+
+// Truncate text at word boundary if possible, else at char limit
+function _truncate(text,max){if(!text)return'';const t=String(text).trim();if(t.length<=max)return t;const cut=t.slice(0,max);const lastSpace=cut.lastIndexOf(' ');return(lastSpace>max*0.6?cut.slice(0,lastSpace):cut)+'…'}
 
 function showMsg(el,text,type){el.textContent=text;el.className=`msg ${type}`;el.style.display='block';setTimeout(()=>{el.style.display='none'},8000)}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
